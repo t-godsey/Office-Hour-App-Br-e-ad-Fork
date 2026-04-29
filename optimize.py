@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,7 +14,143 @@ from pymoo.algorithms.soo.nonconvex.ga import GA
 from pymoo.core.problem import ElementwiseProblem
 from pymoo.optimize import minimize
 
+# Step 2 constants for parsing schedule CSV files into slot arrays.
+DAY_TO_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4}
+DAYS_PER_WEEK = 5
 
+
+def _global_slot(day_code: str, slot_in_day: int, slots_per_day: int) -> int:
+    """Map (day, day-local slot index) to a global slot index."""
+    day = day_code.strip().lower() #removes whitespace and converts to lowercase
+    if day not in DAY_TO_INDEX: #checks if the day is valid
+        raise ValueError(f"Unknown day code: {day_code}")
+    if slot_in_day < 0: #checks if the slot is valid
+        raise ValueError("slot_in_day must be >= 0.")
+    return DAY_TO_INDEX[day] * slots_per_day + slot_in_day
+
+# infers the number of slots per day from the csv files (LOOK INTO MORE)
+def _infer_slots_per_day(
+    teacher_csv_path: str | Path, student_csv_path: str | Path #path to the csv files
+) -> int:
+    """Infer slots_per_day from the max end_slot value in the CSV inputs."""
+    max_end = 0
+
+    with open(teacher_csv_path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            end_slot = int(row["end_slot"])
+            max_end = max(max_end, end_slot)
+
+    with open(student_csv_path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if not row.get("end_slot"):
+                continue
+            end_slot = int(row["end_slot"])
+            max_end = max(max_end, end_slot)
+
+    if max_end <= 0:
+        raise ValueError("Could not infer slots_per_day from CSV files.")
+    return max_end
+
+# loads the teacher's availability from the csv file
+def load_teacher_availability_csv(
+    teacher_csv_path: str | Path, slots_per_day: int
+) -> np.ndarray:
+    """
+    Parse teacher CSV rows into a 1D availability vector.
+
+    Expects columns: day,start_slot,end_slot
+    Uses half-open intervals [start_slot, end_slot).
+    """
+    total_slots = DAYS_PER_WEEK * slots_per_day
+    teacher = np.zeros(total_slots, dtype=bool)
+
+    with open(teacher_csv_path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            day = row["day"].strip().lower()
+            start_slot = int(row["start_slot"])
+            end_slot = int(row["end_slot"])
+
+            if end_slot <= start_slot:
+                raise ValueError(f"Invalid teacher range: {row}")
+
+            g_start = _global_slot(day, start_slot, slots_per_day)
+            g_end = _global_slot(day, end_slot, slots_per_day)
+            teacher[g_start:g_end] = True
+
+    return teacher
+
+
+def load_student_availability_csv(
+    student_csv_path: str | Path, slots_per_day: int
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Parse student CSV rows into a 2D availability matrix.
+
+    Expects columns: id,day,start_slot,end_slot
+    Uses half-open intervals [start_slot, end_slot).
+    Returns (student_matrix, student_ids_in_row_order).
+    """
+    student_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    # Pass 1: gather unique IDs in stable first-seen order.
+    with open(student_csv_path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            student_id = row.get("id", "").strip()
+            if student_id and student_id not in seen_ids:
+                seen_ids.add(student_id)
+                student_ids.append(student_id)
+
+    if not student_ids:
+        raise ValueError("No students found in student CSV.")
+
+    id_to_row = {student_id: idx for idx, student_id in enumerate(student_ids)}
+    total_slots = DAYS_PER_WEEK * slots_per_day
+    students = np.zeros((len(student_ids), total_slots), dtype=bool)
+
+    # Pass 2: fill each student's availability over the global timeline.
+    with open(student_csv_path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            student_id = row.get("id", "").strip()
+            if not student_id:
+                continue
+
+            day = row["day"].strip().lower()
+            start_slot = int(row["start_slot"])
+            end_slot = int(row["end_slot"])
+
+            if end_slot <= start_slot:
+                raise ValueError(f"Invalid student range: {row}")
+
+            g_start = _global_slot(day, start_slot, slots_per_day)
+            g_end = _global_slot(day, end_slot, slots_per_day)
+            students[id_to_row[student_id], g_start:g_end] = True
+
+    return students, student_ids
+
+
+def load_inputs_from_csv(
+    teacher_csv_path: str | Path,
+    student_csv_path: str | Path,
+    slots_per_day: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str], int]:
+    """
+    Step 2 adapter: convert CSV files to optimizer-ready arrays.
+
+    Returns: (student_matrix, teacher_vector, student_ids, slots_per_day)
+    """
+    if slots_per_day is None:
+        slots_per_day = _infer_slots_per_day(teacher_csv_path, student_csv_path)
+
+    teacher = load_teacher_availability_csv(teacher_csv_path, slots_per_day)
+    students, student_ids = load_student_availability_csv(student_csv_path, slots_per_day)
+
+    if students.shape[1] != teacher.shape[0]:
+        raise ValueError("Parsed student and teacher arrays do not align on total slots.")
+
+    return students, teacher, student_ids, slots_per_day
+
+# Checks every student to see which ones are available for the specific time slot
 def _count_students_covered(
     student_availability: np.ndarray, slot_start: int, slot_length_slots: int
 ) -> int:
@@ -33,7 +171,7 @@ def _valid_slot_starts(
             starts.append(start)
     return np.array(starts, dtype=int)
 
-
+# defines the problem that pymoo will solve
 class OfficeHourProblem(ElementwiseProblem):
     """
     Single-objective optimization:
@@ -127,7 +265,21 @@ def _demo_inputs(num_students: int = 6, num_slots: int = 40) -> tuple[np.ndarray
 
 
 if __name__ == "__main__":
-    students, teacher = _demo_inputs()
+    teacher_csv = Path("schedules/teacher_availability.csv")
+    student_csv = Path("schedules/students_availability.csv")
+
+    if teacher_csv.exists() and student_csv.exists():
+        students, teacher, student_ids, slots_per_day = load_inputs_from_csv(
+            teacher_csv, student_csv
+        )
+        print(
+            f"Loaded CSV inputs: {len(student_ids)} students, "
+            f"{slots_per_day} slots/day, {teacher.shape[0]} total slots."
+        )
+    else:
+        students, teacher = _demo_inputs()
+        print("CSV files not found, using synthetic demo inputs.")
+
     best = optimize_office_hour_slot(students, teacher, slot_length_slots=2)
-    print("Best office-hour slot (Step 1 demo):")
+    print("Best office-hour slot:")
     print(best)
